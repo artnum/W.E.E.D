@@ -1,6 +1,7 @@
 #ifndef WEED_FORMAT_H
 #define WEED_FORMAT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* On-wire layout (little-endian), format version WEED_VERSION:

@@ -37,11 +37,9 @@
 
 #include "weed.h"
 #include "weed_format.h"
-
-#include <xxhash.h>
+#include "weed_index.h"
 
 #include <string.h>
-#include <strings.h>
 #include <stdint.h>
 
 module AP_MODULE_DECLARE_DATA weed_module;
@@ -53,11 +51,7 @@ typedef struct weed_runtime {
 	const char *pubkey_path;
 	apr_file_t *file; /* kept open for the lifetime of the mmap */
 	apr_mmap_t *mm;   /* whole archive, APR_MMAP_READ (~ MAP_SHARED|PROT_READ) */
-	const unsigned char *base;
-	apr_size_t size;
-	uint64_t n;
-	const uint64_t *hashes;  /* into mmap, LE on wire = host on LE */
-	const uint64_t *offsets; /* into mmap */
+	weed_map map;     /* pure index view into the mmap */
 	apr_time_t loaded_at;    /* Last-Modified for all items = module load time */
 	char *last_modified;     /* HTTP-date, pool-allocated */
 	struct weed_runtime *next;
@@ -83,22 +77,6 @@ typedef struct weed_pending {
 
 static weed_runtime *weed_runtimes = NULL;
 static weed_pending *weed_pending_list = NULL;
-
-/* ---------- LE helpers ---------- */
-
-static uint32_t weed_load_u32_le(const unsigned char *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-	       ((uint32_t)p[3] << 24);
-}
-
-static uint64_t weed_load_u64_le(const unsigned char *p)
-{
-	return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
-	       ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) |
-	       ((uint64_t)p[5] << 40) | ((uint64_t)p[6] << 48) |
-	       ((uint64_t)p[7] << 56);
-}
 
 /* ---------- config ---------- */
 
@@ -217,14 +195,6 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
-	/* Minimum: signature + empty LE header (reserved + N). */
-	if ((apr_uint64_t)finfo.size <
-	    (apr_uint64_t)WEED_SIG_SIZE + weed_header_size(0)) {
-		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
-		             "mod_weed: archive too small: %s", archive_path);
-		return NULL;
-	}
-
 	/* Entire package in one shared read-only mapping. */
 	apr_mmap_t *mm = NULL;
 	rv = apr_mmap_create(&mm, file, 0, (apr_size_t)finfo.size, APR_MMAP_READ,
@@ -244,47 +214,11 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
-	/* Little-endian header at EOF: ends with file_count; index just before. */
-	uint64_t n = weed_load_u64_le(base + size - 8);
-	if (n > (UINT64_C(1) << 32)) {
+	weed_map map;
+	if (weed_map_from_buffer(base, (uint64_t)size, &map) != 0) {
 		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
-		             "mod_weed: unreasonable file_count in %s", archive_path);
+		             "mod_weed: invalid archive map/header in %s", archive_path);
 		return NULL;
-	}
-
-	uint64_t hdr_sz = weed_header_size(n);
-	if ((uint64_t)size < (uint64_t)WEED_SIG_SIZE + hdr_sz) {
-		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
-		             "mod_weed: truncated header in %s (n=%" APR_UINT64_T_FMT ")",
-		             archive_path, n);
-		return NULL;
-	}
-
-	uint64_t header_start = (uint64_t)size - hdr_sz;
-	const uint64_t *hashes = (const uint64_t *)(base + header_start);
-	const uint64_t *offsets = hashes + n;
-	const unsigned char *reserved =
-	    base + header_start + 16ull * n; /* after hashes+offsets */
-
-	uint8_t ver = reserved[0];
-	if (ver != WEED_VERSION) {
-		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
-		             "mod_weed: unsupported archive version %u in %s "
-		             "(want %u)",
-		             (unsigned)ver, archive_path, (unsigned)WEED_VERSION);
-		return NULL;
-	}
-
-	/* FILEITEMs live in [SIG_SIZE, header_start). */
-	for (uint64_t i = 0; i < n; i++) {
-		if (offsets[i] < (uint64_t)WEED_SIG_SIZE ||
-		    offsets[i] >= header_start) {
-			ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
-			             "mod_weed: bad offset[%" APR_UINT64_T_FMT "]=%" APR_UINT64_T_FMT
-			             " in %s",
-			             i, offsets[i], archive_path);
-			return NULL;
-		}
 	}
 
 	weed_runtime *rt = apr_pcalloc(p, sizeof(*rt));
@@ -292,11 +226,7 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 	rt->pubkey_path = apr_pstrdup(p, pubkey_path);
 	rt->file = file;
 	rt->mm = mm;
-	rt->base = base;
-	rt->size = size;
-	rt->n = n;
-	rt->hashes = hashes;
-	rt->offsets = offsets;
+	rt->map = map;
 	rt->loaded_at = apr_time_now();
 	/* RFC 7231 HTTP-date for Last-Modified (same for every object in this map). */
 	rt->last_modified = apr_palloc(p, APR_RFC822_DATE_LEN);
@@ -308,7 +238,7 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 	ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, s,
 	             "mod_weed: mmap'd %s (%" APR_UINT64_T_FMT " entries, %" APR_SIZE_T_FMT
 	             " bytes, shared read-only)",
-	             archive_path, n, size);
+	             archive_path, (apr_uint64_t)map.n, size);
 	return rt;
 }
 
@@ -353,19 +283,7 @@ static int weed_post_config(apr_pool_t *pconf, apr_pool_t *plog,
 	return OK;
 }
 
-/* ---------- path helpers ---------- */
-
-static int weed_has_dotdot(const char *p, size_t n)
-{
-	size_t i = 0;
-	while (i < n) {
-		if (p[i] == '.' && i + 1 < n && p[i + 1] == '.' &&
-		    (i + 2 == n || p[i + 2] == '/') && (i == 0 || p[i - 1] == '/'))
-			return 1;
-		i++;
-	}
-	return 0;
-}
+/* ---------- path helpers (request-specific) ---------- */
 
 static char *weed_request_relpath(request_rec *r, weed_dir_cfg *cfg)
 {
@@ -410,246 +328,6 @@ static char *weed_request_relpath(request_rec *r, weed_dir_cfg *cfg)
 	return path;
 }
 
-/* ---------- Accept-Encoding + index lookup in mmap ---------- */
-
-/* True if coding appears as a token and is not explicitly q=0. */
-static int weed_ae_wants(const char *ae, const char *coding)
-{
-	if (!ae || !coding)
-		return 0;
-	size_t nlen = strlen(coding);
-	const char *p = ae;
-	while (*p) {
-		while (*p == ' ' || *p == ',' || *p == '\t')
-			p++;
-		if (!*p)
-			break;
-		if (strncasecmp(p, coding, nlen) == 0 &&
-		    (p[nlen] == '\0' || p[nlen] == ',' || p[nlen] == ';' ||
-		     p[nlen] == ' ' || p[nlen] == '\t')) {
-			const char *q = p + nlen;
-			while (*q == ' ' || *q == '\t')
-				q++;
-			if (*q == ';') {
-				/* crude q=0 detection */
-				const char *r = q + 1;
-				while (*r && *r != ',') {
-					if ((*r == 'q' || *r == 'Q') && r[1] == '=') {
-						r += 2;
-						while (*r == ' ' || *r == '\t')
-							r++;
-						if (*r == '0' &&
-						    (r[1] == '\0' || r[1] == ',' || r[1] == ' ' ||
-						     r[1] == '\t' || r[1] == ';'))
-							return 0;
-						if (*r == '0' && r[1] == '.' && r[2] == '0')
-							return 0;
-						break;
-					}
-					r++;
-				}
-			}
-			return 1;
-		}
-		while (*p && *p != ',')
-			p++;
-	}
-	return 0;
-}
-
-typedef struct weed_hit {
-	int64_t idx;
-	uint64_t clen;
-	apr_off_t coff;
-	const char *mime;
-	uint32_t mlen;
-	uint8_t enc;
-	uint8_t cache_flags;
-	uint32_t max_age;
-	const uint8_t *etag; /* 16 bytes in mmap */
-} weed_hit;
-
-/*
- * FILEITEM: clen|plen|mlen|enc|cache_flags|max_age|etag[16]|path|mime|body
- * Prefer br > gzip > identity among twins for this path.
- */
-static int64_t weed_lookup(weed_runtime *rt, const char *path, size_t path_len,
-                           int want_br, int want_gz, weed_hit *hit_out)
-{
-	uint64_t h = XXH64(path, path_len, WEED_XXH_SEED);
-	const uint64_t *hashes = rt->hashes;
-	uint64_t n = rt->n;
-	const unsigned char *base = rt->base;
-	uint64_t size = (uint64_t)rt->size;
-
-	int64_t lo = 0, hi = (int64_t)n - 1, found = -1;
-	while (lo <= hi) {
-		int64_t mid = lo + (hi - lo) / 2;
-		if (hashes[mid] < h)
-			lo = mid + 1;
-		else if (hashes[mid] > h)
-			hi = mid - 1;
-		else {
-			found = mid;
-			break;
-		}
-	}
-	if (found < 0)
-		return -1;
-
-	int64_t left = found;
-	while (left > 0 && hashes[left - 1] == h)
-		left--;
-	int64_t right = found;
-	while (right + 1 < (int64_t)n && hashes[right + 1] == h)
-		right++;
-
-	weed_hit id = {0}, br = {0}, gz = {0};
-	id.idx = br.idx = gz.idx = -1;
-
-	for (int64_t i = left; i <= right; i++) {
-		uint64_t foff = rt->offsets[i];
-		if (foff + (uint64_t)WEED_ITEM_HDR_SIZE > size)
-			continue;
-
-		const unsigned char *item = base + foff;
-		uint64_t clen = weed_load_u64_le(item);
-		uint32_t plen = weed_load_u32_le(item + 8);
-		uint32_t mlen = weed_load_u32_le(item + 12);
-		uint8_t enc = item[16];
-		uint8_t cflags = item[17];
-		uint32_t max_age = weed_load_u32_le(item + 18);
-		const uint8_t *etag = item + 22;
-
-		if (foff + (uint64_t)WEED_ITEM_HDR_SIZE + plen + mlen + clen > size)
-			continue;
-
-		const unsigned char *pbytes = item + WEED_ITEM_HDR_SIZE;
-		if (plen != path_len || memcmp(pbytes, path, path_len) != 0)
-			continue;
-
-		const unsigned char *mbytes = pbytes + plen;
-		weed_hit cur;
-		cur.idx = i;
-		cur.clen = clen;
-		cur.coff = (apr_off_t)(foff + WEED_ITEM_HDR_SIZE + plen + mlen);
-		cur.mime = (const char *)mbytes;
-		cur.mlen = mlen;
-		cur.enc = enc;
-		cur.cache_flags = cflags;
-		cur.max_age = max_age;
-		cur.etag = etag;
-
-		if (enc == WEED_ENC_BR)
-			br = cur;
-		else if (enc == WEED_ENC_GZIP)
-			gz = cur;
-		else
-			id = cur;
-	}
-
-	weed_hit pick;
-	memset(&pick, 0, sizeof pick);
-	pick.idx = -1;
-
-	if (want_br && br.idx >= 0)
-		pick = br;
-	else if (want_gz && gz.idx >= 0)
-		pick = gz;
-	else if (id.idx >= 0)
-		pick = id;
-	else
-		return -1;
-
-	*hit_out = pick;
-	return pick.idx;
-}
-
-static char *weed_format_etag(apr_pool_t *p, const uint8_t etag[WEED_ETAG_SIZE])
-{
-	/* Strong ETag: quoted 32-char lowercase hex of xxh128. */
-	char *s = apr_palloc(p, 2 + 32 + 1);
-	s[0] = '"';
-	static const char hex[] = "0123456789abcdef";
-	for (unsigned i = 0; i < WEED_ETAG_SIZE; i++) {
-		s[1 + 2 * i] = hex[etag[i] >> 4];
-		s[2 + 2 * i] = hex[etag[i] & 0xf];
-	}
-	s[1 + 32] = '"';
-	s[2 + 32] = '\0';
-	return s;
-}
-
-static char *weed_format_cache_control(apr_pool_t *p, uint8_t flags,
-                                       uint32_t max_age)
-{
-	/* Build Cache-Control from pack-time flags + max_age. */
-	char *buf = apr_palloc(p, 128);
-	size_t o = 0;
-	buf[0] = '\0';
-
-	if (flags & WEED_CACHE_NO_STORE)
-		o += (size_t)sprintf(buf + o, "%s%s", o ? ", " : "", "no-store");
-	if (flags & WEED_CACHE_NO_CACHE)
-		o += (size_t)sprintf(buf + o, "%s%s", o ? ", " : "", "no-cache");
-	if (flags & WEED_CACHE_PUBLIC)
-		o += (size_t)sprintf(buf + o, "%s%s", o ? ", " : "", "public");
-	if (flags & WEED_CACHE_PRIVATE)
-		o += (size_t)sprintf(buf + o, "%s%s", o ? ", " : "", "private");
-	if (flags & WEED_CACHE_MUST_REVAL)
-		o += (size_t)sprintf(buf + o, "%s%s", o ? ", " : "", "must-revalidate");
-	if (flags & WEED_CACHE_IMMUTABLE)
-		o += (size_t)sprintf(buf + o, "%s%s", o ? ", " : "", "immutable");
-
-	/* Always emit max-age (default 0 with no-cache). */
-	o += (size_t)sprintf(buf + o, "%smax-age=%u", o ? ", " : "", max_age);
-	(void)o;
-	return buf;
-}
-
-/* If-None-Match: any strong tag match → 304. */
-static int weed_etag_matches(const char *inm, const char *etag)
-{
-	if (!inm || !etag)
-		return 0;
-	if (strcmp(inm, "*") == 0)
-		return 1;
-	/* Walk comma-separated list; ignore weak W/ prefix for comparison. */
-	const char *p = inm;
-	size_t elen = strlen(etag);
-	while (*p) {
-		while (*p == ' ' || *p == ',')
-			p++;
-		if (!*p)
-			break;
-		if (p[0] == 'W' && p[1] == '/')
-			p += 2;
-		while (*p == ' ')
-			p++;
-		if (strncmp(p, etag, elen) == 0 &&
-		    (p[elen] == '\0' || p[elen] == ',' || p[elen] == ' '))
-			return 1;
-		while (*p && *p != ',')
-			p++;
-	}
-	return 0;
-}
-
-static int weed_path_has_extension(const char *path, size_t len)
-{
-	const char *base = path;
-	for (size_t i = 0; i < len; i++) {
-		if (path[i] == '/')
-			base = path + i + 1;
-	}
-	size_t blen = (size_t)(path + len - base);
-	for (size_t i = 0; i < blen; i++) {
-		if (base[i] == '.')
-			return 1;
-	}
-	return 0;
-}
-
 /* ---------- handler ---------- */
 
 static int weed_handler(request_rec *r)
@@ -686,7 +364,7 @@ static int weed_handler(request_rec *r)
 		cfg->rt = rt;
 	}
 
-	if (!rt->mm || !rt->base) {
+	if (!rt->mm || !rt->map.base) {
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
 		              "mod_weed: archive not mapped");
 		return HTTP_INTERNAL_SERVER_ERROR;
@@ -711,11 +389,12 @@ static int weed_handler(request_rec *r)
 	weed_hit hit;
 	memset(&hit, 0, sizeof hit);
 	hit.idx = -1;
-	int64_t idx = weed_lookup(rt, nfc, nfc_len, want_br, want_gz, &hit);
+	int64_t idx =
+	    weed_lookup(&rt->map, nfc, nfc_len, want_br, want_gz, &hit);
 
 	if (idx < 0 && cfg->spa == WEED_SPA_ON &&
 	    !weed_path_has_extension(nfc, nfc_len)) {
-		idx = weed_lookup(rt, "", 0, want_br, want_gz, &hit);
+		idx = weed_lookup(&rt->map, "", 0, want_br, want_gz, &hit);
 		if (idx >= 0) {
 			ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
 			              "mod_weed: SPA fallback for \"%s\" → root doc",
@@ -728,9 +407,13 @@ static int weed_handler(request_rec *r)
 		return HTTP_NOT_FOUND;
 
 	char *mime = apr_pstrmemdup(r->pool, hit.mime, hit.mlen);
-	char *etag = weed_format_etag(r->pool, hit.etag);
-	char *cc =
-	    weed_format_cache_control(r->pool, hit.cache_flags, hit.max_age);
+	char etag_buf[35];
+	weed_format_etag(hit.etag, etag_buf);
+	char *etag = apr_pstrdup(r->pool, etag_buf);
+	char cc_buf[128];
+	weed_format_cache_control(hit.cache_flags, hit.max_age, cc_buf,
+	                          sizeof cc_buf);
+	char *cc = apr_pstrdup(r->pool, cc_buf);
 
 	ap_set_content_type(r, mime);
 	ap_set_content_length(r, (apr_off_t)hit.clen);
@@ -766,7 +449,7 @@ static int weed_handler(request_rec *r)
 		return OK;
 
 	uint64_t content_len = hit.clen;
-	apr_off_t content_off = hit.coff;
+	apr_off_t content_off = (apr_off_t)hit.content_off;
 
 	/*
 	 * Stream from the shared mmap. Use immortal buckets (not apr_bucket_mmap):
@@ -783,7 +466,7 @@ static int weed_handler(request_rec *r)
 	while (left > 0) {
 		apr_size_t chunk =
 		    left > (uint64_t)chunk_max ? chunk_max : (apr_size_t)left;
-		const char *ptr = (const char *)(rt->base + (apr_size_t)off);
+		const char *ptr = (const char *)(rt->map.base + (apr_size_t)off);
 		apr_bucket *b = apr_bucket_immortal_create(
 		    ptr, chunk, r->connection->bucket_alloc);
 		if (!b) {

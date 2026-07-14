@@ -42,11 +42,21 @@ PACK_SRCS := src/main.c src/pack.c src/path.c src/mime.c src/sign.c src/verify.c
              src/compress.c src/cache_policy.c
 PACK_OBJS := $(PACK_SRCS:src/%.c=build/%.o)
 
-MOD_SRCS := mod/mod_weed.c src/path.c src/verify.c
+MOD_SRCS := mod/mod_weed.c src/path.c src/verify.c src/weed_index.c
 
-.PHONY: all module clean test-key smoke smoke-apache install-module
+# Unit test links pure index logic; packer is invoked as a subprocess.
+TEST_SRCS := tests/test_weed_index.c src/weed_index.c src/path.c src/verify.c \
+             src/cache_policy.c src/mime.c
+
+.PHONY: all module clean test test-key smoke smoke-apache install-module
 
 all: build/weed module
+
+test: build/weed test-key build/test_weed_index
+	./build/test_weed_index
+
+build/test_weed_index: $(TEST_SRCS) include/weed_index.h include/weed_format.h include/weed.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $(TEST_SRCS) $(LDFLAGS) $(LDLIBS)
 
 build/weed: $(PACK_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -60,7 +70,7 @@ build:
 # Apache module via apxs (outputs build/mod_weed.so)
 module: build/mod_weed.so
 
-build/mod_weed.so: $(MOD_SRCS) include/weed.h include/weed_format.h | build
+build/mod_weed.so: $(MOD_SRCS) include/weed.h include/weed_format.h include/weed_index.h | build
 	$(APXS) -c \
 		-o mod_weed.so \
 		-I$(CURDIR)/include \

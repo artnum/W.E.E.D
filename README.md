@@ -77,8 +77,9 @@ git clone https://github.com/artnum/W.E.E.D.git
 cd W.E.E.D
 make          # build/weed + build/mod_weed.so
 # optional local checks:
+make test          # unit tests (index/lookup/AE/ETag — no Apache)
 make smoke
-make smoke-apache
+make smoke-apache  # full httpd smoke
 ```
 
 Install the module system-wide (needs root):
