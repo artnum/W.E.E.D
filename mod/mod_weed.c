@@ -12,8 +12,8 @@
  *
  * Startup: verify RSA-4096/SHA-256 signature, then mmap(2) the whole archive
  * MAP_SHARED / PROT_READ (via apr_mmap APR_MMAP_READ). Payload is streamed at
- * pack time; the path-hash index trailer sits at EOF (N in the last 8 bytes).
- * One mapping — shared pages, no per-request open/seek.
+ * pack time; the little-endian header (path-hash index) sits at EOF
+ * (N in the last 8 bytes). One mapping — shared pages, no per-request open.
  *
  * Request: URI → NFC path → xxHash64 → binary search in the map → bucket from
  * the same mmap. With WeedSpa On, a miss without a file extension serves "".
@@ -216,9 +216,9 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
-	/* Minimum: signature + empty trailer (reserved + N). */
+	/* Minimum: signature + empty LE header (reserved + N). */
 	if ((apr_uint64_t)finfo.size <
-	    (apr_uint64_t)WEED_SIG_SIZE + weed_trailer_size(0)) {
+	    (apr_uint64_t)WEED_SIG_SIZE + weed_header_size(0)) {
 		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
 		             "mod_weed: archive too small: %s", archive_path);
 		return NULL;
@@ -243,7 +243,7 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
-	/* Trailer ends with file_count; index lives just before it. */
+	/* Little-endian header at EOF: ends with file_count; index just before. */
 	uint64_t n = weed_load_u64_le(base + size - 8);
 	if (n > (UINT64_C(1) << 32)) {
 		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
@@ -251,19 +251,19 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
-	uint64_t trail = weed_trailer_size(n);
-	if ((uint64_t)size < (uint64_t)WEED_SIG_SIZE + trail) {
+	uint64_t hdr_sz = weed_header_size(n);
+	if ((uint64_t)size < (uint64_t)WEED_SIG_SIZE + hdr_sz) {
 		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
-		             "mod_weed: truncated trailer in %s (n=%" APR_UINT64_T_FMT ")",
+		             "mod_weed: truncated header in %s (n=%" APR_UINT64_T_FMT ")",
 		             archive_path, n);
 		return NULL;
 	}
 
-	uint64_t trailer_start = (uint64_t)size - trail;
-	const uint64_t *hashes = (const uint64_t *)(base + trailer_start);
+	uint64_t header_start = (uint64_t)size - hdr_sz;
+	const uint64_t *hashes = (const uint64_t *)(base + header_start);
 	const uint64_t *offsets = hashes + n;
 	const unsigned char *reserved =
-	    base + trailer_start + 16ull * n; /* after hashes+offsets */
+	    base + header_start + 16ull * n; /* after hashes+offsets */
 
 	uint8_t ver = reserved[0];
 	if (ver != WEED_VERSION) {
@@ -274,10 +274,10 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
-	/* FILEITEMs live in [SIG_SIZE, trailer_start). */
+	/* FILEITEMs live in [SIG_SIZE, header_start). */
 	for (uint64_t i = 0; i < n; i++) {
 		if (offsets[i] < (uint64_t)WEED_SIG_SIZE ||
-		    offsets[i] >= trailer_start) {
+		    offsets[i] >= header_start) {
 			ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
 			             "mod_weed: bad offset[%" APR_UINT64_T_FMT "]=%" APR_UINT64_T_FMT
 			             " in %s",

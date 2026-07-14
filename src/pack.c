@@ -13,62 +13,107 @@
 #include <unistd.h>
 #include <xxhash.h>
 
-struct entry {
-	char *disk_path; /* identity from disk when content == NULL */
-	unsigned char *content; /* owned body (compressed twin or buffered) */
-	int content_owned;
+/*
+ * Streaming packer:
+ *  - Phase A: collect path inventory only (disk + archive path strings).
+ *  - Phase B: open .weed, stream each FILEITEM immediately (identity + twins),
+ *    keep only catalog metadata (hash/offset/path/encoding) in RAM.
+ *  - Phase C: sort catalog, append little-endian header at EOF, sign.
+ *
+ * Peak memory ≈ one file (if --compress) + O(N) path strings + O(N) catalog.
+ */
+
+/* Lightweight inventory before streaming. */
+struct file_job {
+	char *disk_path;
 	char *arch_path;
 	size_t arch_path_len;
-	const char *mime;
-	uint32_t mime_len;
-	uint64_t content_len;
-	uint8_t encoding;
-	uint8_t cache_flags;
-	uint32_t max_age;
-	uint8_t etag[WEED_ETAG_SIZE];
-	uint64_t hash;
-	uint64_t offset;
-	int is_root_doc;
+	int is_root;
 };
 
-struct entry_list {
-	struct entry *v;
+struct job_list {
+	struct file_job *v;
 	size_t n;
 	size_t cap;
 };
 
-static int list_push(struct entry_list *l, struct entry e)
+/* LE-header catalog only — no file bodies. */
+struct cat_entry {
+	char *arch_path;
+	size_t arch_path_len;
+	uint8_t encoding;
+	uint64_t hash;
+	uint64_t offset;
+};
+
+struct catalog {
+	struct cat_entry *v;
+	size_t n;
+	size_t cap;
+};
+
+struct pack_ctx {
+	FILE *out;
+	struct catalog cat;
+	const char *root_file;
+	unsigned compress_flags;
+	size_t n_id;
+	size_t n_br;
+	size_t n_gz;
+};
+
+static int jobs_push(struct job_list *l, struct file_job j)
 {
 	if (l->n == l->cap) {
 		size_t ncap = l->cap ? l->cap * 2 : 64;
-		struct entry *nv =
-		    (struct entry *)realloc(l->v, ncap * sizeof(struct entry));
+		struct file_job *nv =
+		    (struct file_job *)realloc(l->v, ncap * sizeof(*nv));
 		if (!nv)
 			return -1;
 		l->v = nv;
 		l->cap = ncap;
 	}
-	l->v[l->n++] = e;
+	l->v[l->n++] = j;
 	return 0;
 }
 
-static void list_free(struct entry_list *l)
+static void jobs_free(struct job_list *l)
 {
 	for (size_t i = 0; i < l->n; i++) {
 		free(l->v[i].disk_path);
 		free(l->v[i].arch_path);
-		if (l->v[i].content_owned)
-			free(l->v[i].content);
 	}
 	free(l->v);
-	l->v = NULL;
-	l->n = l->cap = 0;
+	memset(l, 0, sizeof *l);
 }
 
-static int cmp_index(const void *a, const void *b)
+static int cat_push(struct catalog *c, struct cat_entry e)
 {
-	const struct entry *ea = *(const struct entry *const *)a;
-	const struct entry *eb = *(const struct entry *const *)b;
+	if (c->n == c->cap) {
+		size_t ncap = c->cap ? c->cap * 2 : 64;
+		struct cat_entry *nv =
+		    (struct cat_entry *)realloc(c->v, ncap * sizeof(*nv));
+		if (!nv)
+			return -1;
+		c->v = nv;
+		c->cap = ncap;
+	}
+	c->v[c->n++] = e;
+	return 0;
+}
+
+static void cat_free(struct catalog *c)
+{
+	for (size_t i = 0; i < c->n; i++)
+		free(c->v[i].arch_path);
+	free(c->v);
+	memset(c, 0, sizeof *c);
+}
+
+static int cmp_cat(const void *a, const void *b)
+{
+	const struct cat_entry *ea = *(const struct cat_entry *const *)a;
+	const struct cat_entry *eb = *(const struct cat_entry *const *)b;
 	if (ea->hash < eb->hash)
 		return -1;
 	if (ea->hash > eb->hash)
@@ -149,6 +194,98 @@ static int clean_list_path(char *line, size_t *len_out)
 	return 0;
 }
 
+static void store_xxh128(XXH128_hash_t h, uint8_t out[WEED_ETAG_SIZE])
+{
+	uint64_t lo = h.low64;
+	uint64_t hi = h.high64;
+	for (int i = 0; i < 8; i++) {
+		out[i] = (uint8_t)(lo >> (8 * i));
+		out[8 + i] = (uint8_t)(hi >> (8 * i));
+	}
+}
+
+/* Stream file once: compute ETag without holding the whole body. */
+static int etag_file_stream(const char *path, uint64_t expect_len,
+                            uint8_t etag[WEED_ETAG_SIZE])
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		perror(path);
+		return -1;
+	}
+	XXH3_state_t *st = XXH3_createState();
+	if (!st || XXH3_128bits_reset_withSeed(st, WEED_ETAG_SEED) == XXH_ERROR) {
+		fprintf(stderr, "weed: xxhash state failed\n");
+		if (st)
+			XXH3_freeState(st);
+		fclose(f);
+		return -1;
+	}
+	unsigned char buf[64 * 1024];
+	uint64_t total = 0;
+	for (;;) {
+		size_t n = fread(buf, 1, sizeof buf, f);
+		if (n > 0) {
+			XXH3_128bits_update(st, buf, n);
+			total += n;
+		}
+		if (n < sizeof buf) {
+			if (ferror(f)) {
+				perror(path);
+				XXH3_freeState(st);
+				fclose(f);
+				return -1;
+			}
+			break;
+		}
+	}
+	fclose(f);
+	if (total != expect_len) {
+		fprintf(stderr, "weed: size changed while hashing: %s\n", path);
+		XXH3_freeState(st);
+		return -1;
+	}
+	store_xxh128(XXH3_128bits_digest(st), etag);
+	XXH3_freeState(st);
+	return 0;
+}
+
+static int copy_file_stream(FILE *out, const char *path, uint64_t expect_len)
+{
+	FILE *in = fopen(path, "rb");
+	if (!in) {
+		perror(path);
+		return -1;
+	}
+	unsigned char buf[64 * 1024];
+	uint64_t total = 0;
+	for (;;) {
+		size_t n = fread(buf, 1, sizeof buf, in);
+		if (n > 0) {
+			if (fwrite(buf, 1, n, out) != n) {
+				perror("fwrite content");
+				fclose(in);
+				return -1;
+			}
+			total += n;
+		}
+		if (n < sizeof buf) {
+			if (ferror(in)) {
+				perror(path);
+				fclose(in);
+				return -1;
+			}
+			break;
+		}
+	}
+	fclose(in);
+	if (total != expect_len) {
+		fprintf(stderr, "weed: size changed while packing: %s\n", path);
+		return -1;
+	}
+	return 0;
+}
+
 static int read_file_all(const char *path, unsigned char **out, size_t *out_len)
 {
 	FILE *f = fopen(path, "rb");
@@ -187,80 +324,317 @@ static int read_file_all(const char *path, unsigned char **out, size_t *out_len)
 	return 0;
 }
 
-static int push_variant(struct entry_list *list, const char *disk_path,
-                        char *arch, size_t arch_len, const char *mime,
-                        uint8_t encoding, unsigned char *content,
-                        size_t content_len, int content_owned,
-                        uint8_t cache_flags, uint32_t max_age,
-                        const uint8_t etag[WEED_ETAG_SIZE], int is_root)
+static int cat_has_dup(const struct catalog *c, const char *arch, size_t arch_len,
+                       uint8_t encoding)
 {
-	for (size_t i = 0; i < list->n; i++) {
-		if (list->v[i].encoding == encoding &&
-		    list->v[i].arch_path_len == arch_len &&
-		    memcmp(list->v[i].arch_path, arch, arch_len) == 0) {
-			fprintf(stderr,
-			        "weed: duplicate path+encoding \"%.*s\" enc=%u\n",
-			        (int)arch_len, arch, encoding);
-			if (content_owned)
-				free(content);
-			return -1;
-		}
-	}
-
-	struct entry e;
-	memset(&e, 0, sizeof e);
-	if (disk_path) {
-		e.disk_path = strdup(disk_path);
-		if (!e.disk_path) {
-			if (content_owned)
-				free(content);
-			return -1;
-		}
-	}
-	e.content = content;
-	e.content_owned = content_owned;
-	e.arch_path = arch;
-	e.arch_path_len = arch_len;
-	e.mime = mime;
-	e.mime_len = (uint32_t)strlen(mime);
-	e.content_len = (uint64_t)content_len;
-	e.encoding = encoding;
-	e.cache_flags = cache_flags;
-	e.max_age = max_age;
-	memcpy(e.etag, etag, WEED_ETAG_SIZE);
-	e.hash = XXH64(arch, arch_len, WEED_XXH_SEED);
-	e.is_root_doc = is_root && encoding == WEED_ENC_IDENTITY;
-
-	if (list_push(list, e) != 0) {
-		free(e.disk_path);
-		if (content_owned)
-			free(content);
-		return -1;
+	for (size_t i = 0; i < c->n; i++) {
+		if (c->v[i].encoding == encoding && c->v[i].arch_path_len == arch_len &&
+		    memcmp(c->v[i].arch_path, arch, arch_len) == 0)
+			return 1;
 	}
 	return 0;
 }
 
 /*
- * Add identity (+ optional compressed twins). Takes ownership of arch on success
- * for the identity entry; twins get strdup'd arch copies.
+ * Write one FILEITEM at current out position; append catalog row.
+ * content: if non-NULL write that buffer; else stream from disk_path.
+ * Takes no ownership of arch (copies for catalog).
  */
-static int add_file_with_twins(struct entry_list *list, const char *disk_path,
-                               char *arch, size_t arch_len,
-                               const char *root_file, int *have_root,
-                               unsigned compress_flags)
+static int emit_fileitem(struct pack_ctx *ctx, const char *arch, size_t arch_len,
+                         const char *mime, uint32_t mime_len, uint8_t encoding,
+                         uint8_t cache_flags, uint32_t max_age,
+                         const uint8_t etag[WEED_ETAG_SIZE], uint64_t content_len,
+                         const unsigned char *content, const char *disk_path)
 {
-	struct stat st;
-	if (stat(disk_path, &st) != 0) {
-		perror(disk_path);
-		free(arch);
+	if (arch_len > 0xffffffffu || mime_len > 0xffffffffu) {
+		fprintf(stderr, "weed: path or mime too long\n");
 		return -1;
 	}
-	if (!S_ISREG(st.st_mode)) {
-		fprintf(stderr, "weed: not a regular file: %s\n", disk_path);
-		free(arch);
+	if (cat_has_dup(&ctx->cat, arch, arch_len, encoding)) {
+		fprintf(stderr, "weed: duplicate path+encoding \"%.*s\" enc=%u\n",
+		        (int)arch_len, arch, encoding);
 		return -1;
 	}
 
+	off_t pos = ftello(ctx->out);
+	if (pos < 0) {
+		perror("ftello");
+		return -1;
+	}
+
+	if (weed_write_u64_le(ctx->out, content_len) != 0 ||
+	    weed_write_u32_le(ctx->out, (uint32_t)arch_len) != 0 ||
+	    weed_write_u32_le(ctx->out, mime_len) != 0) {
+		perror("fwrite fileitem header");
+		return -1;
+	}
+	if (fputc((int)encoding, ctx->out) == EOF ||
+	    fputc((int)cache_flags, ctx->out) == EOF) {
+		perror("fwrite encoding/cache");
+		return -1;
+	}
+	if (weed_write_u32_le(ctx->out, max_age) != 0) {
+		perror("fwrite max_age");
+		return -1;
+	}
+	if (fwrite(etag, 1, WEED_ETAG_SIZE, ctx->out) != WEED_ETAG_SIZE) {
+		perror("fwrite etag");
+		return -1;
+	}
+	if (arch_len && fwrite(arch, 1, arch_len, ctx->out) != arch_len) {
+		perror("fwrite path");
+		return -1;
+	}
+	if (mime_len && fwrite(mime, 1, mime_len, ctx->out) != mime_len) {
+		perror("fwrite mime");
+		return -1;
+	}
+
+	if (content) {
+		if (content_len &&
+		    fwrite(content, 1, (size_t)content_len, ctx->out) !=
+		        (size_t)content_len) {
+			perror("fwrite content");
+			return -1;
+		}
+	} else {
+		if (copy_file_stream(ctx->out, disk_path, content_len) != 0)
+			return -1;
+	}
+
+	char *path_copy = (char *)malloc(arch_len ? arch_len : 1);
+	if (!path_copy)
+		return -1;
+	if (arch_len)
+		memcpy(path_copy, arch, arch_len);
+
+	struct cat_entry ce;
+	memset(&ce, 0, sizeof ce);
+	ce.arch_path = path_copy;
+	ce.arch_path_len = arch_len;
+	ce.encoding = encoding;
+	ce.hash = XXH64(arch, arch_len, WEED_XXH_SEED);
+	ce.offset = (uint64_t)pos;
+	if (cat_push(&ctx->cat, ce) != 0) {
+		free(path_copy);
+		return -1;
+	}
+
+	if (encoding == WEED_ENC_IDENTITY)
+		ctx->n_id++;
+	else if (encoding == WEED_ENC_BR)
+		ctx->n_br++;
+	else if (encoding == WEED_ENC_GZIP)
+		ctx->n_gz++;
+	return 0;
+}
+
+/* Process one source file: stream identity (+ twins) to archive, free temps. */
+static int stream_one_file(struct pack_ctx *ctx, const struct file_job *job)
+{
+	struct stat st;
+	if (stat(job->disk_path, &st) != 0) {
+		perror(job->disk_path);
+		return -1;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "weed: not a regular file: %s\n", job->disk_path);
+		return -1;
+	}
+
+	uint64_t raw_len = (uint64_t)st.st_size;
+	const char *mime = weed_mime_from_path(job->arch_path, job->arch_path_len);
+	if (job->is_root)
+		mime = "text/html";
+	uint32_t mime_len = (uint32_t)strlen(mime);
+
+	uint8_t cache_flags = WEED_CACHE_NO_CACHE;
+	uint32_t max_age = 0;
+	weed_cache_for_mime(mime, &cache_flags, &max_age);
+
+	unsigned char *raw = NULL;
+	size_t raw_sz = 0;
+
+	if (ctx->compress_flags) {
+		/* One-file buffer only when compression is requested. */
+		if (read_file_all(job->disk_path, &raw, &raw_sz) != 0)
+			return -1;
+		if ((uint64_t)raw_sz != raw_len) {
+			fprintf(stderr, "weed: size changed: %s\n", job->disk_path);
+			free(raw);
+			return -1;
+		}
+
+		uint8_t etag_id[WEED_ETAG_SIZE];
+		weed_etag_xxh128(raw, raw_sz, etag_id);
+
+		if (emit_fileitem(ctx, job->arch_path, job->arch_path_len, mime,
+		                  mime_len, WEED_ENC_IDENTITY, cache_flags, max_age,
+		                  etag_id, raw_len, raw, NULL) != 0) {
+			free(raw);
+			return -1;
+		}
+
+		if (ctx->compress_flags & WEED_COMPRESS_BR) {
+			unsigned char *br = NULL;
+			size_t br_len = 0;
+			int rc = weed_compress_br(raw, raw_sz, &br, &br_len);
+			if (rc < 0) {
+				fprintf(stderr, "weed: brotli failed for %s\n",
+				        job->disk_path);
+				free(raw);
+				return -1;
+			}
+			if (rc == 0) {
+				uint8_t etag_br[WEED_ETAG_SIZE];
+				weed_etag_xxh128(br, br_len, etag_br);
+				if (emit_fileitem(ctx, job->arch_path, job->arch_path_len,
+				                  mime, mime_len, WEED_ENC_BR, cache_flags,
+				                  max_age, etag_br, br_len, br, NULL) != 0) {
+					free(br);
+					free(raw);
+					return -1;
+				}
+				free(br); /* written; do not keep */
+			}
+		}
+
+		if (ctx->compress_flags & WEED_COMPRESS_GZIP) {
+			unsigned char *gz = NULL;
+			size_t gz_len = 0;
+			int rc = weed_compress_gzip(raw, raw_sz, &gz, &gz_len);
+			if (rc < 0) {
+				fprintf(stderr, "weed: gzip failed for %s\n",
+				        job->disk_path);
+				free(raw);
+				return -1;
+			}
+			if (rc == 0) {
+				uint8_t etag_gz[WEED_ETAG_SIZE];
+				weed_etag_xxh128(gz, gz_len, etag_gz);
+				if (emit_fileitem(ctx, job->arch_path, job->arch_path_len,
+				                  mime, mime_len, WEED_ENC_GZIP, cache_flags,
+				                  max_age, etag_gz, gz_len, gz, NULL) != 0) {
+					free(gz);
+					free(raw);
+					return -1;
+				}
+				free(gz);
+			}
+		}
+
+		free(raw);
+		return 0;
+	}
+
+	/* No compress: stream hash + stream copy, never hold full body. */
+	uint8_t etag_id[WEED_ETAG_SIZE];
+	if (etag_file_stream(job->disk_path, raw_len, etag_id) != 0)
+		return -1;
+	return emit_fileitem(ctx, job->arch_path, job->arch_path_len, mime, mime_len,
+	                     WEED_ENC_IDENTITY, cache_flags, max_age, etag_id,
+	                     raw_len, NULL, job->disk_path);
+}
+
+static int finish_archive(struct pack_ctx *ctx, const char *out_path,
+                          const char *key_path)
+{
+	uint64_t n = (uint64_t)ctx->cat.n;
+
+	struct cat_entry **idx =
+	    (struct cat_entry **)malloc(n ? n * sizeof(*idx) : 1);
+	if (!idx)
+		return -1;
+	for (size_t i = 0; i < ctx->cat.n; i++)
+		idx[i] = &ctx->cat.v[i];
+	qsort(idx, ctx->cat.n, sizeof(*idx), cmp_cat);
+
+	for (size_t i = 0; i < ctx->cat.n; i++) {
+		if (weed_write_u64_le(ctx->out, idx[i]->hash) != 0) {
+			perror("fwrite hash");
+			free(idx);
+			return -1;
+		}
+	}
+	for (size_t i = 0; i < ctx->cat.n; i++) {
+		if (weed_write_u64_le(ctx->out, idx[i]->offset) != 0) {
+			perror("fwrite offset");
+			free(idx);
+			return -1;
+		}
+	}
+	free(idx);
+
+	unsigned char reserved[WEED_RESERVED_SIZE];
+	memset(reserved, 0, sizeof reserved);
+	reserved[0] = (unsigned char)WEED_VERSION;
+	if (fwrite(reserved, 1, WEED_RESERVED_SIZE, ctx->out) != WEED_RESERVED_SIZE) {
+		perror("fwrite reserved");
+		return -1;
+	}
+	if (weed_write_u64_le(ctx->out, n) != 0) {
+		perror("fwrite file_count");
+		return -1;
+	}
+	if (fflush(ctx->out) != 0) {
+		perror("fflush");
+		return -1;
+	}
+	fclose(ctx->out);
+	ctx->out = NULL;
+
+	if (weed_sign_file(key_path, out_path) != 0)
+		return -1;
+
+	fprintf(stderr,
+	        "weed: packed %llu item(s) (identity=%zu br=%zu gzip=%zu) -> %s\n",
+	        (unsigned long long)n, ctx->n_id, ctx->n_br, ctx->n_gz, out_path);
+	return 0;
+}
+
+static int ensure_root_file_ok(const char *root_file)
+{
+	if (!root_file || !root_file[0])
+		return 0;
+	if (strchr(root_file, '/')) {
+		fprintf(stderr,
+		        "weed: root file must be a single name (got \"%s\")\n",
+		        root_file);
+		return -1;
+	}
+	return 0;
+}
+
+static void promote_root_job(struct job_list *jobs)
+{
+	size_t ri = (size_t)-1;
+	for (size_t i = 0; i < jobs->n; i++) {
+		if (jobs->v[i].is_root) {
+			ri = i;
+			break;
+		}
+	}
+	if (ri != (size_t)-1 && ri != 0) {
+		struct file_job tmp = jobs->v[0];
+		jobs->v[0] = jobs->v[ri];
+		jobs->v[ri] = tmp;
+	}
+}
+
+static int jobs_has_arch(const struct job_list *jobs, const char *arch,
+                         size_t arch_len)
+{
+	for (size_t i = 0; i < jobs->n; i++) {
+		if (jobs->v[i].arch_path_len == arch_len &&
+		    memcmp(jobs->v[i].arch_path, arch, arch_len) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+static int add_job(struct job_list *jobs, const char *disk_path, char *arch,
+                   size_t arch_len, const char *root_file, int *have_root)
+{
 	int is_root = 0;
 	if (root_file && strcmp(arch, root_file) == 0) {
 		free(arch);
@@ -273,136 +647,52 @@ static int add_file_with_twins(struct entry_list *list, const char *disk_path,
 		*have_root = 1;
 	}
 
-	const char *mime = weed_mime_from_path(arch, arch_len);
-	if (is_root)
-		mime = "text/html";
-
-	uint8_t cache_flags = WEED_CACHE_NO_CACHE;
-	uint32_t max_age = 0;
-	weed_cache_for_mime(mime, &cache_flags, &max_age);
-
-	/* Always read body: ETag (xxh128) is over the stored content bytes. */
-	unsigned char *raw = NULL;
-	size_t raw_len = 0;
-	if (read_file_all(disk_path, &raw, &raw_len) != 0) {
-		free(arch);
-		return -1;
-	}
-	if ((uint64_t)raw_len != (uint64_t)st.st_size) {
-		fprintf(stderr, "weed: size changed: %s\n", disk_path);
-		free(raw);
+	if (jobs_has_arch(jobs, arch, arch_len)) {
+		fprintf(stderr, "weed: duplicate archive path \"%.*s\"\n",
+		        (int)arch_len, arch);
 		free(arch);
 		return -1;
 	}
 
-	size_t path_len = arch_len;
-	char *path_copy = (char *)malloc(path_len ? path_len : 1);
-	if (!path_copy) {
+	struct file_job j;
+	memset(&j, 0, sizeof j);
+	j.disk_path = strdup(disk_path);
+	if (!j.disk_path) {
 		free(arch);
-		free(raw);
 		return -1;
 	}
-	if (path_len)
-		memcpy(path_copy, arch, path_len);
-
-	uint8_t etag_id[WEED_ETAG_SIZE];
-	weed_etag_xxh128(raw, raw_len, etag_id);
-
-	/* Identity streams from disk at write; etag already computed. */
-	if (push_variant(list, disk_path, arch, arch_len, mime, WEED_ENC_IDENTITY,
-	                 NULL, raw_len, 0, cache_flags, max_age, etag_id,
-	                 is_root) != 0) {
-		free(path_copy);
-		free(raw);
+	j.arch_path = arch;
+	j.arch_path_len = arch_len;
+	j.is_root = is_root;
+	if (jobs_push(jobs, j) != 0) {
+		free(j.disk_path);
+		free(j.arch_path);
 		return -1;
 	}
-
-	if (compress_flags & WEED_COMPRESS_BR) {
-		unsigned char *br = NULL;
-		size_t br_len = 0;
-		int rc = weed_compress_br(raw, raw_len, &br, &br_len);
-		if (rc < 0) {
-			fprintf(stderr, "weed: brotli failed for %s\n", disk_path);
-			free(path_copy);
-			free(raw);
-			return -1;
-		}
-		if (rc == 0) {
-			uint8_t etag_br[WEED_ETAG_SIZE];
-			weed_etag_xxh128(br, br_len, etag_br);
-			char *arch2 = (char *)malloc(path_len ? path_len : 1);
-			if (!arch2) {
-				free(br);
-				free(path_copy);
-				free(raw);
-				return -1;
-			}
-			if (path_len)
-				memcpy(arch2, path_copy, path_len);
-			if (push_variant(list, NULL, arch2, path_len, mime, WEED_ENC_BR,
-			                 br, br_len, 1, cache_flags, max_age, etag_br,
-			                 is_root) != 0) {
-				free(arch2);
-				free(path_copy);
-				free(raw);
-				return -1;
-			}
-		}
-	}
-
-	if (compress_flags & WEED_COMPRESS_GZIP) {
-		unsigned char *gz = NULL;
-		size_t gz_len = 0;
-		int rc = weed_compress_gzip(raw, raw_len, &gz, &gz_len);
-		if (rc < 0) {
-			fprintf(stderr, "weed: gzip failed for %s\n", disk_path);
-			free(path_copy);
-			free(raw);
-			return -1;
-		}
-		if (rc == 0) {
-			uint8_t etag_gz[WEED_ETAG_SIZE];
-			weed_etag_xxh128(gz, gz_len, etag_gz);
-			char *arch2 = (char *)malloc(path_len ? path_len : 1);
-			if (!arch2) {
-				free(gz);
-				free(path_copy);
-				free(raw);
-				return -1;
-			}
-			if (path_len)
-				memcpy(arch2, path_copy, path_len);
-			if (push_variant(list, NULL, arch2, path_len, mime, WEED_ENC_GZIP,
-			                 gz, gz_len, 1, cache_flags, max_age, etag_gz,
-			                 is_root) != 0) {
-				free(arch2);
-				free(path_copy);
-				free(raw);
-				return -1;
-			}
-		}
-	}
-
-	free(path_copy);
-	free(raw);
 	return 0;
 }
 
-static int add_file_under_root(struct entry_list *list, const char *disk_path,
-                               const char *root_dir, const char *root_file,
-                               int *have_root, unsigned compress_flags)
+static int collect_file(struct job_list *jobs, const char *disk_path,
+                        const char *root_dir, const char *root_file,
+                        int *have_root)
 {
+	struct stat st;
+	if (stat(disk_path, &st) != 0) {
+		perror(disk_path);
+		return -1;
+	}
+	if (!S_ISREG(st.st_mode))
+		return 0;
+
 	char *arch = NULL;
 	size_t arch_len = 0;
 	if (weed_relpath_nfc(root_dir, disk_path, &arch, &arch_len) != 0)
 		return -1;
-	return add_file_with_twins(list, disk_path, arch, arch_len, root_file,
-	                           have_root, compress_flags);
+	return add_job(jobs, disk_path, arch, arch_len, root_file, have_root);
 }
 
-static int walk_dir(struct entry_list *list, const char *dir,
-                    const char *root_dir, const char *root_file, int *have_root,
-                    unsigned compress_flags)
+static int walk_dir(struct job_list *jobs, const char *dir, const char *root_dir,
+                    const char *root_file, int *have_root)
 {
 	DIR *d = opendir(dir);
 	if (!d) {
@@ -431,11 +721,9 @@ static int walk_dir(struct entry_list *list, const char *dir,
 
 		int rc = 0;
 		if (S_ISDIR(st.st_mode))
-			rc = walk_dir(list, child, root_dir, root_file, have_root,
-			              compress_flags);
+			rc = walk_dir(jobs, child, root_dir, root_file, have_root);
 		else if (S_ISREG(st.st_mode))
-			rc = add_file_under_root(list, child, root_dir, root_file,
-			                         have_root, compress_flags);
+			rc = collect_file(jobs, child, root_dir, root_file, have_root);
 
 		free(child);
 		if (rc != 0) {
@@ -447,9 +735,9 @@ static int walk_dir(struct entry_list *list, const char *dir,
 	return 0;
 }
 
-static int add_listed_path(struct entry_list *list, const char *line_in,
-                           const char *base_dir, const char *root_file,
-                           int *have_root, unsigned compress_flags)
+static int collect_listed(struct job_list *jobs, const char *line_in,
+                          const char *base_dir, const char *root_file,
+                          int *have_root)
 {
 	char *line = strdup(line_in);
 	if (!line)
@@ -490,93 +778,14 @@ static int add_listed_path(struct entry_list *list, const char *line_in,
 	}
 	free(line);
 
-	int rc = add_file_with_twins(list, disk, arch, arch_len, root_file,
-	                             have_root, compress_flags);
+	int rc = add_job(jobs, disk, arch, arch_len, root_file, have_root);
 	free(disk);
 	return rc;
 }
 
-static int write_content(FILE *out, struct entry *e)
-{
-	if (e->content) {
-		if (e->content_len &&
-		    fwrite(e->content, 1, (size_t)e->content_len, out) !=
-		        (size_t)e->content_len) {
-			perror("fwrite content");
-			return -1;
-		}
-		return 0;
-	}
-
-	FILE *in = fopen(e->disk_path, "rb");
-	if (!in) {
-		perror(e->disk_path);
-		return -1;
-	}
-	unsigned char buf[64 * 1024];
-	uint64_t total = 0;
-	for (;;) {
-		size_t n = fread(buf, 1, sizeof buf, in);
-		if (n > 0) {
-			if (fwrite(buf, 1, n, out) != n) {
-				perror("fwrite content");
-				fclose(in);
-				return -1;
-			}
-			total += n;
-		}
-		if (n < sizeof buf) {
-			if (ferror(in)) {
-				perror(e->disk_path);
-				fclose(in);
-				return -1;
-			}
-			break;
-		}
-	}
-	fclose(in);
-	if (total != e->content_len) {
-		fprintf(stderr, "weed: size changed while packing: %s\n",
-		        e->disk_path);
-		return -1;
-	}
-	return 0;
-}
-
-static int ensure_root_file_ok(const char *root_file)
-{
-	if (!root_file || !root_file[0])
-		return 0;
-	if (strchr(root_file, '/')) {
-		fprintf(stderr,
-		        "weed: root file must be a single name (got \"%s\")\n",
-		        root_file);
-		return -1;
-	}
-	return 0;
-}
-
-static void promote_root_first(struct entry_list *list, int have_root)
-{
-	if (!have_root)
-		return;
-	size_t ri = (size_t)-1;
-	for (size_t i = 0; i < list->n; i++) {
-		if (list->v[i].is_root_doc) {
-			ri = i;
-			break;
-		}
-	}
-	if (ri != (size_t)-1 && ri != 0) {
-		struct entry tmp = list->v[0];
-		list->v[0] = list->v[ri];
-		list->v[ri] = tmp;
-	}
-}
-
-static int pack_entries(struct entry_list *list, const char *out_path,
-                        const char *key_path, const char *root_file,
-                        int have_root)
+static int run_pack_jobs(struct job_list *jobs, const char *out_path,
+                         const char *key_path, unsigned compress_flags,
+                         int have_root, const char *root_file)
 {
 	if (!have_root) {
 		fprintf(stderr,
@@ -584,145 +793,51 @@ static int pack_entries(struct entry_list *list, const char *out_path,
 		        "no \"\" entry\n",
 		        root_file ? root_file : WEED_DEFAULT_ROOT_FILE);
 	}
-
-	promote_root_first(list, have_root);
-
-	uint64_t n = (uint64_t)list->n;
-
-	for (size_t i = 0; i < list->n; i++) {
-		if (list->v[i].arch_path_len > 0xffffffffu ||
-		    list->v[i].mime_len > 0xffffffffu) {
-			fprintf(stderr, "weed: path or mime too long\n");
-			return -1;
-		}
+	if (jobs->n == 0) {
+		fprintf(stderr, "weed: empty file list\n");
+		return -1;
 	}
 
-	struct entry **idx = NULL;
-	FILE *out = fopen(out_path, "wb+");
-	if (!out) {
+	promote_root_job(jobs);
+
+	struct pack_ctx ctx;
+	memset(&ctx, 0, sizeof ctx);
+	ctx.compress_flags = compress_flags;
+
+	ctx.out = fopen(out_path, "wb+");
+	if (!ctx.out) {
 		perror(out_path);
 		return -1;
 	}
 
-	/* Signature placeholder; payload streams immediately after. */
 	unsigned char zeros[WEED_SIG_SIZE];
 	memset(zeros, 0, sizeof zeros);
-	if (fwrite(zeros, 1, WEED_SIG_SIZE, out) != WEED_SIG_SIZE) {
+	if (fwrite(zeros, 1, WEED_SIG_SIZE, ctx.out) != WEED_SIG_SIZE) {
 		perror("fwrite sig");
-		goto fail;
-	}
-
-	/*
-	 * Stream FILEITEMs while recording absolute offsets. Index catalog is
-	 * built in memory and written only after the payload (trailer).
-	 */
-	size_t n_id = 0, n_br = 0, n_gz = 0;
-	for (size_t i = 0; i < list->n; i++) {
-		struct entry *e = &list->v[i];
-		off_t pos = ftello(out);
-		if (pos < 0) {
-			perror("ftello");
-			goto fail;
-		}
-		e->offset = (uint64_t)pos;
-
-		if (weed_write_u64_le(out, e->content_len) != 0 ||
-		    weed_write_u32_le(out, (uint32_t)e->arch_path_len) != 0 ||
-		    weed_write_u32_le(out, e->mime_len) != 0) {
-			perror("fwrite fileitem header");
-			goto fail;
-		}
-		if (fputc((int)e->encoding, out) == EOF ||
-		    fputc((int)e->cache_flags, out) == EOF) {
-			perror("fwrite encoding/cache");
-			goto fail;
-		}
-		if (weed_write_u32_le(out, e->max_age) != 0) {
-			perror("fwrite max_age");
-			goto fail;
-		}
-		if (fwrite(e->etag, 1, WEED_ETAG_SIZE, out) != WEED_ETAG_SIZE) {
-			perror("fwrite etag");
-			goto fail;
-		}
-		if (e->arch_path_len &&
-		    fwrite(e->arch_path, 1, e->arch_path_len, out) != e->arch_path_len) {
-			perror("fwrite path");
-			goto fail;
-		}
-		if (fwrite(e->mime, 1, e->mime_len, out) != e->mime_len) {
-			perror("fwrite mime");
-			goto fail;
-		}
-		if (write_content(out, e) != 0)
-			goto fail;
-
-		if (e->encoding == WEED_ENC_IDENTITY)
-			n_id++;
-		else if (e->encoding == WEED_ENC_BR)
-			n_br++;
-		else if (e->encoding == WEED_ENC_GZIP)
-			n_gz++;
-	}
-
-	/* Sort catalog, then append trailer: hashes | offsets | reserved | N */
-	idx = (struct entry **)malloc(list->n ? list->n * sizeof(*idx) : 1);
-	if (!idx)
-		goto fail;
-	for (size_t i = 0; i < list->n; i++)
-		idx[i] = &list->v[i];
-	qsort(idx, list->n, sizeof(*idx), cmp_index);
-
-	for (size_t i = 0; i < list->n; i++) {
-		if (weed_write_u64_le(out, idx[i]->hash) != 0) {
-			perror("fwrite hash");
-			free(idx);
-			goto fail;
-		}
-	}
-	for (size_t i = 0; i < list->n; i++) {
-		if (weed_write_u64_le(out, idx[i]->offset) != 0) {
-			perror("fwrite offset");
-			free(idx);
-			goto fail;
-		}
-	}
-	free(idx);
-	idx = NULL;
-
-	unsigned char reserved[WEED_RESERVED_SIZE];
-	memset(reserved, 0, sizeof reserved);
-	reserved[0] = (unsigned char)WEED_VERSION;
-	if (fwrite(reserved, 1, WEED_RESERVED_SIZE, out) != WEED_RESERVED_SIZE) {
-		perror("fwrite reserved");
-		goto fail;
-	}
-	if (weed_write_u64_le(out, n) != 0) {
-		perror("fwrite file_count");
-		goto fail;
-	}
-
-	if (fflush(out) != 0) {
-		perror("fflush");
-		goto fail;
-	}
-	fclose(out);
-	out = NULL;
-
-	if (weed_sign_file(key_path, out_path) != 0)
+		fclose(ctx.out);
+		unlink(out_path);
 		return -1;
+	}
 
-	fprintf(stderr,
-	        "weed: packed %llu item(s) (identity=%zu br=%zu gzip=%zu) -> %s\n",
-	        (unsigned long long)n, n_id, n_br, n_gz, out_path);
+	for (size_t i = 0; i < jobs->n; i++) {
+		if (stream_one_file(&ctx, &jobs->v[i]) != 0) {
+			if (ctx.out)
+				fclose(ctx.out);
+			cat_free(&ctx.cat);
+			unlink(out_path);
+			return -1;
+		}
+	}
+
+	if (finish_archive(&ctx, out_path, key_path) != 0) {
+		if (ctx.out)
+			fclose(ctx.out);
+		cat_free(&ctx.cat);
+		unlink(out_path);
+		return -1;
+	}
+	cat_free(&ctx.cat);
 	return 0;
-
-fail:
-	if (out)
-		fclose(out);
-	free(idx);
-	unlink(out_path);
-	return -1;
 }
 
 int weed_pack(const char *root_dir, const char *out_path, const char *key_path,
@@ -733,23 +848,22 @@ int weed_pack(const char *root_dir, const char *out_path, const char *key_path,
 	if (ensure_root_file_ok(root_file) != 0)
 		return -1;
 
-	struct entry_list list = {0};
-	int have_root = 0;
-
 	struct stat st;
 	if (stat(root_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
 		fprintf(stderr, "weed: not a directory: %s\n", root_dir);
 		return -1;
 	}
 
-	if (walk_dir(&list, root_dir, root_dir, root_file, &have_root,
-	             compress_flags) != 0) {
-		list_free(&list);
+	struct job_list jobs = {0};
+	int have_root = 0;
+	if (walk_dir(&jobs, root_dir, root_dir, root_file, &have_root) != 0) {
+		jobs_free(&jobs);
 		return -1;
 	}
 
-	int rc = pack_entries(&list, out_path, key_path, root_file, have_root);
-	list_free(&list);
+	int rc = run_pack_jobs(&jobs, out_path, key_path, compress_flags, have_root,
+	                       root_file);
+	jobs_free(&jobs);
 	return rc;
 }
 
@@ -770,20 +884,18 @@ int weed_pack_list(FILE *in, const char *base_dir, const char *out_path,
 		}
 	}
 
-	struct entry_list list = {0};
+	struct job_list jobs = {0};
 	int have_root = 0;
-
 	char *line = NULL;
 	size_t line_cap = 0;
 	ssize_t nread;
 	size_t lineno = 0;
 	while ((nread = getline(&line, &line_cap, in)) != -1) {
 		lineno++;
-		if (add_listed_path(&list, line, base_dir, root_file, &have_root,
-		                    compress_flags) != 0) {
+		if (collect_listed(&jobs, line, base_dir, root_file, &have_root) != 0) {
 			fprintf(stderr, "weed: error at list line %zu\n", lineno);
 			free(line);
-			list_free(&list);
+			jobs_free(&jobs);
 			return -1;
 		}
 	}
@@ -791,17 +903,12 @@ int weed_pack_list(FILE *in, const char *base_dir, const char *out_path,
 
 	if (ferror(in)) {
 		perror("weed: reading file list");
-		list_free(&list);
+		jobs_free(&jobs);
 		return -1;
 	}
 
-	if (list.n == 0) {
-		fprintf(stderr, "weed: empty file list\n");
-		list_free(&list);
-		return -1;
-	}
-
-	int rc = pack_entries(&list, out_path, key_path, root_file, have_root);
-	list_free(&list);
+	int rc = run_pack_jobs(&jobs, out_path, key_path, compress_flags, have_root,
+	                       root_file);
+	jobs_free(&jobs);
 	return rc;
 }

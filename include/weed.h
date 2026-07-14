@@ -37,7 +37,9 @@ int weed_pack(const char *root_dir, const char *out_path, const char *key_path,
 
 /*
  * Pack paths listed on `in`, one path per line (empty lines skipped).
- * Reads the whole list first, then writes the archive (N known up front).
+ * Paths are inventoried first (strings only); each file is then streamed to
+ * the archive immediately so compressed bodies are not retained in RAM;
+ * the little-endian header (catalog) is written at EOF.
  * Archive path = NFC-normalized line (no leading '/').
  * Disk path = line, or base_dir/line when base_dir is non-NULL/non-empty.
  */

@@ -15,6 +15,8 @@ Format version: **1** (`reserved[0] = 1`).
 
 **Deploy model:** build → pack → copy `site.weed` + public key to servers → reload Apache. No rsync of thousands of files.
 
+**Packer memory:** path inventory only, then one file at a time (stream identity; optional compress buffer for that file only); catalog metadata for the little-endian header at EOF.
+
 ---
 
 ## Dependencies
@@ -262,20 +264,20 @@ Stable URLs + revalidation; no need for Vite-style hashed filenames for correctn
 
 ## Format (version 1, summary)
 
-Little-endian. **Payload first, index trailer at the end** (stream-friendly packing):
+Everything is **little-endian** — so the archive **header lives at the end of the file** (the natural place for a header when you read the low end of the stream). Payload is written first; the catalog is appended as that LE header. Stream-friendly packing, same idea as putting a tape TOC after the data.
 
 ```text
 u8  signature[512]     RSA-4096 PKCS#1 v1.5 over SHA-256 of everything after this field
 FILEITEM...            streamed payload (starts at offset 512)
 
---- trailer ---
+--- little-endian header (at EOF) ---
 u64 path_hash[N]       xxHash64(path), seed 0; sorted by (hash, path, encoding)
 u64 file_offset[N]     absolute offset of each FILEITEM
 u8  reserved[16]       reserved[0]=1 (version); rest zeros
 u64 file_count         N  (last 8 bytes of the file)
 ```
 
-Reader: `N = u64le(file[size-8])`, trailer size = `16*N + 16 + 8`.
+Reader: `N = u64le(file[size-8])`, header size = `16*N + 16 + 8`, header starts at `size - header_size`.
 
 ```text
 FILEITEM:

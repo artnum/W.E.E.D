@@ -8,16 +8,18 @@
  *   u8  signature[WEED_SIG_SIZE]     RSA-4096 PKCS#1 v1.5 over SHA-256 of
  *                                    everything after this field
  *   FILEITEM...                      payload; streamed in pack order
+ *   ---- little-endian header (catalog at EOF) ----
  *   u64 path_hash[N]                 xxh64(path), seed 0;
  *                                    sorted by (hash, path, encoding)
  *   u64 file_offset[N]               absolute FILEITEM offsets; same order
  *   u8  reserved[WEED_RESERVED_SIZE] reserved[0]=version; rest zeros
  *   u64 file_count                   N (last 8 bytes of the file)
  *
- * The index trailer sits at the end so the packer can stream FILEITEMs while
- * building the catalog in memory, then append hashes/offsets/count.
- * Reader: N = u64le at file_size-8; trailer_size = 16*N + 16 + 8;
- * trailer starts at file_size - trailer_size.
+ * Why the "header" is at the end: the archive is little-endian, so structural
+ * metadata lives at the low addresses when you read the stream backwards —
+ * the natural place for a header. Practically: stream FILEITEMs first, build
+ * the catalog in memory, then append it. Reader: N = u64le at file_size-8;
+ * header_size = 16*N + 16 + 8; header starts at file_size - header_size.
  *
  * FILEITEM:
  *   u64 content_len
@@ -62,8 +64,8 @@
 #define WEED_ITEM_HDR_SIZE \
 	(8u + 4u + 4u + 1u + 1u + 4u + WEED_ETAG_SIZE) /* 38 */
 
-/* Trailer: hashes[N] + offsets[N] + reserved[16] + file_count u64 */
-static inline uint64_t weed_trailer_size(uint64_t n)
+/* Little-endian header at EOF: hashes[N] + offsets[N] + reserved[16] + N */
+static inline uint64_t weed_header_size(uint64_t n)
 {
 	return 16ull * n + (uint64_t)WEED_RESERVED_SIZE + 8ull;
 }
