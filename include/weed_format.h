@@ -3,17 +3,21 @@
 
 #include <stdint.h>
 
-/* On-wire layout (little-endian):
+/* On-wire layout (little-endian), format version WEED_VERSION:
  *
  *   u8  signature[WEED_SIG_SIZE]     RSA-4096 PKCS#1 v1.5 over SHA-256 of
  *                                    everything after this field
- *   u8  reserved[WEED_RESERVED_SIZE] first byte = format version (WEED_VERSION);
- *                                    remaining 15 bytes reserved (zeros)
- *   u64 file_count                   N
+ *   FILEITEM...                      payload; streamed in pack order
  *   u64 path_hash[N]                 xxh64(path), seed 0;
  *                                    sorted by (hash, path, encoding)
- *   u64 file_offset[N]               absolute offset of FILEITEM; same order
- *   FILEITEM...                      pack order; no padding
+ *   u64 file_offset[N]               absolute FILEITEM offsets; same order
+ *   u8  reserved[WEED_RESERVED_SIZE] reserved[0]=version; rest zeros
+ *   u64 file_count                   N (last 8 bytes of the file)
+ *
+ * The index trailer sits at the end so the packer can stream FILEITEMs while
+ * building the catalog in memory, then append hashes/offsets/count.
+ * Reader: N = u64le at file_size-8; trailer_size = 16*N + 16 + 8;
+ * trailer starts at file_size - trailer_size.
  *
  * FILEITEM:
  *   u64 content_len
@@ -21,14 +25,13 @@
  *   u32 mime_len
  *   u8  content_encoding             WEED_ENC_*
  *   u8  cache_flags                  WEED_CACHE_* bitfield
- *   u32 max_age                      seconds (with cache_flags → Cache-Control)
+ *   u32 max_age
  *   u8  etag[WEED_ETAG_SIZE]         XXH3-128 of content, seed WEED_ETAG_SEED
  *   u8  path[path_len]
  *   u8  mime[mime_len]
  *   u8  content[content_len]
  *
- * Default cache when packer has no type rule: NO_CACHE, max_age=0.
- * Twins: same path, different encodings; each body has its own etag.
+ * Payload starts at offset WEED_SIG_SIZE. Twins: same path, different encodings.
  */
 
 #define WEED_SIG_SIZE       512u
@@ -36,7 +39,6 @@
 #define WEED_VERSION        1u   /* on-wire format version (reserved[0]) */
 #define WEED_XXH_SEED       0ull
 
-/* Content ETag: XXH3 128-bit, seed 0xEB */
 #define WEED_ETAG_SEED      0xEBull
 #define WEED_ETAG_SIZE      16u
 
@@ -50,7 +52,6 @@
 #define WEED_COMPRESS_GZIP  1u
 #define WEED_COMPRESS_BR    2u
 
-/* cache_flags (u8 bitfield) → Cache-Control tokens */
 #define WEED_CACHE_NO_CACHE   0x01u
 #define WEED_CACHE_NO_STORE   0x02u
 #define WEED_CACHE_PUBLIC     0x04u
@@ -58,14 +59,13 @@
 #define WEED_CACHE_IMMUTABLE  0x10u
 #define WEED_CACHE_MUST_REVAL 0x20u
 
-/* Fixed FILEITEM header size before path (all fields above path) */
 #define WEED_ITEM_HDR_SIZE \
 	(8u + 4u + 4u + 1u + 1u + 4u + WEED_ETAG_SIZE) /* 38 */
 
-static inline uint64_t weed_header_size(uint64_t n)
+/* Trailer: hashes[N] + offsets[N] + reserved[16] + file_count u64 */
+static inline uint64_t weed_trailer_size(uint64_t n)
 {
-	return (uint64_t)WEED_SIG_SIZE + (uint64_t)WEED_RESERVED_SIZE + 8ull
-	       + 16ull * n;
+	return 16ull * n + (uint64_t)WEED_RESERVED_SIZE + 8ull;
 }
 
 static inline uint64_t weed_fileitem_size(uint32_t path_len, uint32_t mime_len,

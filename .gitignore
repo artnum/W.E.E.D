@@ -17,3 +17,9 @@ core.*
 *~
 *.swp
 .DS_Store
+
+# Keys (never commit)
+*.pem
+weed_priv.pem
+weed_pub.pem
+

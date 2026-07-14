@@ -262,15 +262,22 @@ Stable URLs + revalidation; no need for Vite-style hashed filenames for correctn
 
 ## Format (version 1, summary)
 
-Little-endian.
+Little-endian. **Payload first, index trailer at the end** (stream-friendly packing):
 
 ```text
 u8  signature[512]     RSA-4096 PKCS#1 v1.5 over SHA-256 of everything after this field
-u8  reserved[16]       reserved[0]=1 (version); rest zeros
-u64 file_count         N
+FILEITEM...            streamed payload (starts at offset 512)
+
+--- trailer ---
 u64 path_hash[N]       xxHash64(path), seed 0; sorted by (hash, path, encoding)
 u64 file_offset[N]     absolute offset of each FILEITEM
+u8  reserved[16]       reserved[0]=1 (version); rest zeros
+u64 file_count         N  (last 8 bytes of the file)
+```
 
+Reader: `N = u64le(file[size-8])`, trailer size = `16*N + 16 + 8`.
+
+```text
 FILEITEM:
   u64 content_len
   u32 path_len

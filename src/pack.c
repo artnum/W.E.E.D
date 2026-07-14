@@ -588,35 +588,23 @@ static int pack_entries(struct entry_list *list, const char *out_path,
 	promote_root_first(list, have_root);
 
 	uint64_t n = (uint64_t)list->n;
-	uint64_t hdr = weed_header_size(n);
 
-	uint64_t off = hdr;
 	for (size_t i = 0; i < list->n; i++) {
 		if (list->v[i].arch_path_len > 0xffffffffu ||
 		    list->v[i].mime_len > 0xffffffffu) {
 			fprintf(stderr, "weed: path or mime too long\n");
 			return -1;
 		}
-		list->v[i].offset = off;
-		off += weed_fileitem_size((uint32_t)list->v[i].arch_path_len,
-		                          list->v[i].mime_len, list->v[i].content_len);
 	}
 
-	struct entry **idx =
-	    (struct entry **)malloc(list->n ? list->n * sizeof(*idx) : 1);
-	if (!idx)
-		return -1;
-	for (size_t i = 0; i < list->n; i++)
-		idx[i] = &list->v[i];
-	qsort(idx, list->n, sizeof(*idx), cmp_index);
-
+	struct entry **idx = NULL;
 	FILE *out = fopen(out_path, "wb+");
 	if (!out) {
 		perror(out_path);
-		free(idx);
 		return -1;
 	}
 
+	/* Signature placeholder; payload streams immediately after. */
 	unsigned char zeros[WEED_SIG_SIZE];
 	memset(zeros, 0, sizeof zeros);
 	if (fwrite(zeros, 1, WEED_SIG_SIZE, out) != WEED_SIG_SIZE) {
@@ -624,44 +612,19 @@ static int pack_entries(struct entry_list *list, const char *out_path,
 		goto fail;
 	}
 
-	unsigned char reserved[WEED_RESERVED_SIZE];
-	memset(reserved, 0, sizeof reserved);
-	reserved[0] = (unsigned char)WEED_VERSION; /* 8-bit format version */
-	if (fwrite(reserved, 1, WEED_RESERVED_SIZE, out) != WEED_RESERVED_SIZE) {
-		perror("fwrite reserved");
-		goto fail;
-	}
-
-	if (weed_write_u64_le(out, n) != 0) {
-		perror("fwrite file_count");
-		goto fail;
-	}
-
-	for (size_t i = 0; i < list->n; i++) {
-		if (weed_write_u64_le(out, idx[i]->hash) != 0) {
-			perror("fwrite hash");
-			goto fail;
-		}
-	}
-	for (size_t i = 0; i < list->n; i++) {
-		if (weed_write_u64_le(out, idx[i]->offset) != 0) {
-			perror("fwrite offset");
-			goto fail;
-		}
-	}
-
+	/*
+	 * Stream FILEITEMs while recording absolute offsets. Index catalog is
+	 * built in memory and written only after the payload (trailer).
+	 */
 	size_t n_id = 0, n_br = 0, n_gz = 0;
 	for (size_t i = 0; i < list->n; i++) {
 		struct entry *e = &list->v[i];
 		off_t pos = ftello(out);
-		if (pos < 0 || (uint64_t)pos != e->offset) {
-			fprintf(stderr,
-			        "weed: internal offset mismatch for \"%.*s\" "
-			        "(at %lld want %llu)\n",
-			        (int)e->arch_path_len, e->arch_path, (long long)pos,
-			        (unsigned long long)e->offset);
+		if (pos < 0) {
+			perror("ftello");
 			goto fail;
 		}
+		e->offset = (uint64_t)pos;
 
 		if (weed_write_u64_le(out, e->content_len) != 0 ||
 		    weed_write_u32_le(out, (uint32_t)e->arch_path_len) != 0 ||
@@ -702,14 +665,49 @@ static int pack_entries(struct entry_list *list, const char *out_path,
 			n_gz++;
 	}
 
+	/* Sort catalog, then append trailer: hashes | offsets | reserved | N */
+	idx = (struct entry **)malloc(list->n ? list->n * sizeof(*idx) : 1);
+	if (!idx)
+		goto fail;
+	for (size_t i = 0; i < list->n; i++)
+		idx[i] = &list->v[i];
+	qsort(idx, list->n, sizeof(*idx), cmp_index);
+
+	for (size_t i = 0; i < list->n; i++) {
+		if (weed_write_u64_le(out, idx[i]->hash) != 0) {
+			perror("fwrite hash");
+			free(idx);
+			goto fail;
+		}
+	}
+	for (size_t i = 0; i < list->n; i++) {
+		if (weed_write_u64_le(out, idx[i]->offset) != 0) {
+			perror("fwrite offset");
+			free(idx);
+			goto fail;
+		}
+	}
+	free(idx);
+	idx = NULL;
+
+	unsigned char reserved[WEED_RESERVED_SIZE];
+	memset(reserved, 0, sizeof reserved);
+	reserved[0] = (unsigned char)WEED_VERSION;
+	if (fwrite(reserved, 1, WEED_RESERVED_SIZE, out) != WEED_RESERVED_SIZE) {
+		perror("fwrite reserved");
+		goto fail;
+	}
+	if (weed_write_u64_le(out, n) != 0) {
+		perror("fwrite file_count");
+		goto fail;
+	}
+
 	if (fflush(out) != 0) {
 		perror("fflush");
 		goto fail;
 	}
 	fclose(out);
 	out = NULL;
-	free(idx);
-	idx = NULL;
 
 	if (weed_sign_file(key_path, out_path) != 0)
 		return -1;

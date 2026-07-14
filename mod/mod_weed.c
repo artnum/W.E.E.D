@@ -11,9 +11,9 @@
  *   </Location>
  *
  * Startup: verify RSA-4096/SHA-256 signature, then mmap(2) the whole archive
- * MAP_SHARED / PROT_READ (via apr_mmap APR_MMAP_READ). The path-hash index and
- * payload live in that single mapping — shared physical pages across workers,
- * no per-request open/seek, no separate shm copy of the index.
+ * MAP_SHARED / PROT_READ (via apr_mmap APR_MMAP_READ). Payload is streamed at
+ * pack time; the path-hash index trailer sits at EOF (N in the last 8 bytes).
+ * One mapping — shared pages, no per-request open/seek.
  *
  * Request: URI → NFC path → xxHash64 → binary search in the map → bucket from
  * the same mmap. With WeedSpa On, a miss without a file extension serves "".
@@ -216,8 +216,9 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
+	/* Minimum: signature + empty trailer (reserved + N). */
 	if ((apr_uint64_t)finfo.size <
-	    (apr_uint64_t)WEED_SIG_SIZE + WEED_RESERVED_SIZE + 8ull) {
+	    (apr_uint64_t)WEED_SIG_SIZE + weed_trailer_size(0)) {
 		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
 		             "mod_weed: archive too small: %s", archive_path);
 		return NULL;
@@ -234,7 +235,6 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
-	/* apr_mmap_t is a public struct; mm is the MAP_SHARED mapping base. */
 	const unsigned char *base = (const unsigned char *)mm->mm;
 	apr_size_t size = mm->size;
 	if (!base || size != (apr_size_t)finfo.size) {
@@ -243,8 +243,29 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
-	/* reserved[0] = format version (8 bits of the 128-bit reserved area). */
-	uint8_t ver = base[WEED_SIG_SIZE];
+	/* Trailer ends with file_count; index lives just before it. */
+	uint64_t n = weed_load_u64_le(base + size - 8);
+	if (n > (UINT64_C(1) << 32)) {
+		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
+		             "mod_weed: unreasonable file_count in %s", archive_path);
+		return NULL;
+	}
+
+	uint64_t trail = weed_trailer_size(n);
+	if ((uint64_t)size < (uint64_t)WEED_SIG_SIZE + trail) {
+		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
+		             "mod_weed: truncated trailer in %s (n=%" APR_UINT64_T_FMT ")",
+		             archive_path, n);
+		return NULL;
+	}
+
+	uint64_t trailer_start = (uint64_t)size - trail;
+	const uint64_t *hashes = (const uint64_t *)(base + trailer_start);
+	const uint64_t *offsets = hashes + n;
+	const unsigned char *reserved =
+	    base + trailer_start + 16ull * n; /* after hashes+offsets */
+
+	uint8_t ver = reserved[0];
 	if (ver != WEED_VERSION) {
 		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
 		             "mod_weed: unsupported archive version %u in %s "
@@ -253,28 +274,10 @@ static weed_runtime *weed_load_runtime(apr_pool_t *p, server_rec *s,
 		return NULL;
 	}
 
-	uint64_t n =
-	    weed_load_u64_le(base + WEED_SIG_SIZE + WEED_RESERVED_SIZE);
-	uint64_t hdr = weed_header_size(n);
-
-	if ((uint64_t)size < hdr) {
-		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
-		             "mod_weed: truncated header in %s (n=%" APR_UINT64_T_FMT ")",
-		             archive_path, n);
-		return NULL;
-	}
-	if (n > (UINT64_C(1) << 32)) {
-		ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
-		             "mod_weed: unreasonable file_count in %s", archive_path);
-		return NULL;
-	}
-
-	const uint64_t *hashes =
-	    (const uint64_t *)(base + WEED_SIG_SIZE + WEED_RESERVED_SIZE + 8);
-	const uint64_t *offsets = hashes + n;
-
+	/* FILEITEMs live in [SIG_SIZE, trailer_start). */
 	for (uint64_t i = 0; i < n; i++) {
-		if (offsets[i] < hdr || offsets[i] >= (uint64_t)size) {
+		if (offsets[i] < (uint64_t)WEED_SIG_SIZE ||
+		    offsets[i] >= trailer_start) {
 			ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s,
 			             "mod_weed: bad offset[%" APR_UINT64_T_FMT "]=%" APR_UINT64_T_FMT
 			             " in %s",
