@@ -1,5 +1,6 @@
 /*
- * mod_weed — serve static assets from a signed Weed archive.
+ * mod_weed — serve static assets from a signed Weed archive
+ * (Whole-site Enclosed Exportable Disk-image).
  *
  *   LoadModule weed_module modules/mod_weed.so
  *

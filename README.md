@@ -4,6 +4,14 @@
 
 Format version: **1** (`reserved[0] = 1`).
 
+### Name
+
+**W.E.E.D.** — **W**hole-site **E**nclosed **E**xportable **D**isk-image.
+
+Over-serious on purpose: the entire static site is sealed into one **enclosed**, **exportable** artifact—closer to a **disk image** than a tarball of loose paths. You ship the image, verify it, mmap it, and serve; you do not sprinkle files across the document root.
+
+(File extension: `.weed`.)
+
 ---
 
 ## What you get
