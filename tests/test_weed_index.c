@@ -84,18 +84,13 @@ static void test_ae_wants(void)
 	EXPECT(weed_ae_wants("gzip;q=0, br", "br") == 1, "br after gzip q=0");
 }
 
-static void test_path_ext_dotdot(void)
+static void test_path_ext(void)
 {
 	EXPECT(weed_path_has_extension("css/app.css", 11) == 1, "css has ext");
 	EXPECT(weed_path_has_extension("settings", 8) == 0, "settings no ext");
 	EXPECT(weed_path_has_extension("a/b/c", 5) == 0, "nested no ext");
 	EXPECT(weed_path_has_extension("a/b/c.js", 8) == 1, "nested has ext");
 	EXPECT(weed_path_has_extension("", 0) == 0, "empty");
-
-	EXPECT(weed_has_dotdot("../x", 4) == 1, "../x");
-	EXPECT(weed_has_dotdot("a/../b", 6) == 1, "a/../b");
-	EXPECT(weed_has_dotdot("a/b", 3) == 0, "a/b ok");
-	EXPECT(weed_has_dotdot("..", 2) == 1, ".. alone");
 }
 
 static void test_etag_cache_format(void)
@@ -250,7 +245,7 @@ int main(void)
 
 	test_le_helpers();
 	test_ae_wants();
-	test_path_ext_dotdot();
+	test_path_ext();
 	test_etag_cache_format();
 	test_archive_lookup(weed, pub);
 

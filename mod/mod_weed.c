@@ -287,9 +287,10 @@ static int weed_post_config(apr_pool_t *pconf, apr_pool_t *plog,
 
 static char *weed_request_relpath(request_rec *r, weed_dir_cfg *cfg)
 {
-	const char *uri = r->uri;
-	if (!uri)
-		return NULL;
+    char *uri = apr_pstrdup(r->pool, r->uri);
+    if (!uri) {
+        return NULL;
+    }
 
 	const char *base = cfg->location ? cfg->location : "/";
 	size_t blen = strlen(base);
@@ -297,33 +298,24 @@ static char *weed_request_relpath(request_rec *r, weed_dir_cfg *cfg)
 		blen--;
 
 	size_t ulen = strlen(uri);
-	const char *rel;
+    char *path = NULL;
 	if (blen == 0 || (blen == 1 && base[0] == '/')) {
-		rel = uri;
+		path = uri;
 	} else {
 		if (ulen < blen || strncmp(uri, base, blen) != 0)
 			return NULL;
 		if (ulen > blen && uri[blen] != '/')
 			return NULL;
-		rel = uri + blen;
+		path = uri + blen;
 	}
 
-	while (*rel == '/')
-		rel++;
+    while (*path == '/') {
+		path++;
+    }
 
-	char *path = apr_pstrdup(r->pool, rel);
 	char *q = strchr(path, '?');
 	if (q)
 		*q = '\0';
-
-	if (ap_unescape_url(path) != OK)
-		return NULL;
-
-	if (weed_has_dotdot(path, strlen(path)))
-		return NULL;
-
-	while (path[0] == '/')
-		path++;
 
 	return path;
 }

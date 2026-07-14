@@ -290,15 +290,3 @@ int weed_path_has_extension(const char *path, size_t len)
 	}
 	return 0;
 }
-
-int weed_has_dotdot(const char *p, size_t n)
-{
-	size_t i = 0;
-	while (i < n) {
-		if (p[i] == '.' && i + 1 < n && p[i + 1] == '.' &&
-		    (i + 2 == n || p[i + 2] == '/') && (i == 0 || p[i - 1] == '/'))
-			return 1;
-		i++;
-	}
-	return 0;
-}

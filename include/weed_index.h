@@ -56,7 +56,6 @@ void weed_format_cache_control(uint8_t flags, uint32_t max_age, char *out,
 int weed_etag_matches(const char *if_none_match, const char *etag);
 
 int weed_path_has_extension(const char *path, size_t len);
-int weed_has_dotdot(const char *p, size_t n);
 
 uint32_t weed_load_u32_le(const unsigned char *p);
 uint64_t weed_load_u64_le(const unsigned char *p);
