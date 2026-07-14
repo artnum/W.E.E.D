@@ -4,6 +4,22 @@
 
 Format version: **1** (`reserved[0] = 1`).
 
+### Written By
+
+This idea has been around in my head for quite a long time now, I never got the time to write it. So
+I tasked Grok to do what I was too lazy to do. I didn't do any extensive code-review myself, I just
+needed the idea to come out in some way.
+The idea is really to have something were you put all your html/js/css file in their final shipable
+form send it to the server as on blob, change a symlink, reload apache and done. If the new image is
+missing something, just switch back to the old one. The idea is the atomicity of the operation.
+And maybe someone may change the apache module to support A/B testing in some kind of automated way,
+put two W.E.E.D image that are distributed at random between session (it is not supported yet).
+It can be used as a solution for dynamic generated static web site : on process during the night
+generate the whole website, pack it into W.E.E.D, replace the previous version, reload apache and
+done, no tiny forgotten file left by accident that may popup six months down the road to make suffer
+in pain trying to figure out what's wrong.
+So this section is, at this time, the only human written part. The rest is all Grok.
+
 ### Name
 
 **W.E.E.D.** — **W**hole-site **E**nclosed **E**xportable **D**isk-image.
