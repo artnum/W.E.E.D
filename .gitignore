@@ -1,0 +1,19 @@
+# Build outputs
+/build/
+/.libs/
+/mod/.libs/
+/src/.libs/
+*.o
+*.lo
+*.la
+*.slo
+*.so
+mod_weed.so
+mod_weed.la
+
+# Crash dumps / editor
+core
+core.*
+*~
+*.swp
+.DS_Store
