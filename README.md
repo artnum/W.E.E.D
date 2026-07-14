@@ -367,4 +367,6 @@ sudo tail -f /var/log/apache2/error.log
 
 ## License / project status
 
+**Public domain** via [**CC0 1.0 Universal**](https://creativecommons.org/publicdomain/zero/1.0/) — see [`LICENSE`](LICENSE). To the extent possible under law, all copyright and related rights in this work are waived. You may copy, modify, distribute, and use the code and format for any purpose, commercial or non-commercial, without asking permission.
+
 Format **v1**. Packer + Apache module are the supported surface. There is no separate unpacker required for production serving (the module is the reader).
