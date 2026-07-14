@@ -474,8 +474,7 @@ typedef struct weed_hit {
  * Prefer br > gzip > identity among twins for this path.
  */
 static int64_t weed_lookup(weed_runtime *rt, const char *path, size_t path_len,
-                           int want_br, int want_gz, weed_hit *hit_out,
-                           apr_pool_t *pool)
+                           int want_br, int want_gz, weed_hit *hit_out)
 {
 	uint64_t h = XXH64(path, path_len, WEED_XXH_SEED);
 	const uint64_t *hashes = rt->hashes;
@@ -563,7 +562,6 @@ static int64_t weed_lookup(weed_runtime *rt, const char *path, size_t path_len,
 		return -1;
 
 	*hit_out = pick;
-	(void)pool;
 	return pick.idx;
 }
 
@@ -713,11 +711,11 @@ static int weed_handler(request_rec *r)
 	weed_hit hit;
 	memset(&hit, 0, sizeof hit);
 	hit.idx = -1;
-	int64_t idx = weed_lookup(rt, nfc, nfc_len, want_br, want_gz, &hit, r->pool);
+	int64_t idx = weed_lookup(rt, nfc, nfc_len, want_br, want_gz, &hit);
 
 	if (idx < 0 && cfg->spa == WEED_SPA_ON &&
 	    !weed_path_has_extension(nfc, nfc_len)) {
-		idx = weed_lookup(rt, "", 0, want_br, want_gz, &hit, r->pool);
+		idx = weed_lookup(rt, "", 0, want_br, want_gz, &hit);
 		if (idx >= 0) {
 			ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
 			              "mod_weed: SPA fallback for \"%s\" → root doc",
