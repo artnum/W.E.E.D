@@ -73,8 +73,8 @@ sudo apt-get install -y \
 ## Build
 
 ```bash
-git clone <this-repo> web-distribution
-cd web-distribution
+git clone https://github.com/artnum/W.E.E.D.git
+cd W.E.E.D
 make          # build/weed + build/mod_weed.so
 # optional local checks:
 make smoke
