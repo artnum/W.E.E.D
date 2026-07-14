@@ -20,6 +20,16 @@ done, no tiny forgotten file left by accident that may popup six months down the
 in pain trying to figure out what's wrong.
 So this section is, at this time, the only human written part. The rest is all Grok.
 
+### Usefulness
+
+After some trying, I found that's much more cool than I thought before. First, instead of
+black listing what you don't want to be served, you white list what you want to be served. It feels
+sane. This might a legit idea in the end. Also, with the good automation, you produce the right blob
+to be served (sure there is something to do with git and that thing).
+By putting the header at the end, it would be easy to add file into it. So it would be a legit way
+to put uploaded file into it, served from outside of the root directory and without ways to
+"execute" the uploaded file.
+
 ### Name
 
 **W.E.E.D.** — **W**hole-site **E**nclosed **E**xportable **D**isk-image.
