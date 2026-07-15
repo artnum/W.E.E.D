@@ -2,6 +2,7 @@
 #include "weed_format.h"
 
 #include <string.h>
+#include <strings.h>
 
 struct mime_ent {
 	const char *ext;
@@ -73,19 +74,9 @@ const char *weed_mime_from_path(const char *path, size_t path_len)
 		size_t n = strlen(e->ext);
 		if (n != ext_len)
 			continue;
-		int match = 1;
-		for (size_t i = 0; i < n; i++) {
-			char a = ext[i];
-			char b = e->ext[i];
-			if (a >= 'A' && a <= 'Z')
-				a = (char)(a - 'A' + 'a');
-			if (a != b) {
-				match = 0;
-				break;
-			}
-		}
-		if (match)
+        if (strcasecmp(ext, e->ext) == 0) {
 			return e->mime;
+        }
 	}
 	return WEED_DEFAULT_MIME;
 }
