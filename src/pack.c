@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <xxhash.h>
 
+#define WEED_BUFFER_SIZE    (64*1024)
+
 /*
  * Streaming packer:
  *  - Phase A: collect path inventory only (disk + archive path strings).
@@ -221,7 +223,7 @@ static int etag_file_stream(const char *path, uint64_t expect_len,
 		fclose(f);
 		return -1;
 	}
-	unsigned char buf[64 * 1024];
+	unsigned char buf[WEED_BUFFER_SIZE];
 	uint64_t total = 0;
 	for (;;) {
 		size_t n = fread(buf, 1, sizeof buf, f);
@@ -257,7 +259,7 @@ static int copy_file_stream(FILE *out, const char *path, uint64_t expect_len)
 		perror(path);
 		return -1;
 	}
-	unsigned char buf[64 * 1024];
+	unsigned char buf[WEED_BUFFER_SIZE];
 	uint64_t total = 0;
 	for (;;) {
 		size_t n = fread(buf, 1, sizeof buf, in);
